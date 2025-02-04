@@ -1,6 +1,6 @@
 #define MyAppName "Topiary"
 #define MyAppVersion "1.0.0"
-#define MyAppPublisher "Your Company Name"
+#define MyAppPublisher "Alden JG"
 #define MyAppExeName "Topiary.exe"
 #define MyAppPublishDir "bin\Release\net8.0-windows\publish"
 
