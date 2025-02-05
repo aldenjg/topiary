@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![.NET](https://img.shields.io/badge/.NET-8.0-512BD4)](https://dotnet.microsoft.com/download/dotnet/8.0)
 
-![showcasegif](https://github.com/user-attachments/assets/e36a93ee-0774-4c8b-b693-25696c328dcf)
+![ezgif](https://github.com/user-attachments/assets/13f46ddb-473e-4508-b3ae-f24aa210f924)
 
 Topiary is a modern, lightweight disk space analyzer powered by AI insights. It helps users understand and manage their disk usage through an intuitive WPF interface and intelligent file analysis.
 
