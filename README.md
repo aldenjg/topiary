@@ -45,7 +45,6 @@ cd topiary
 
 - **.NET 8.0**: Core framework
 - **WPF**: UI framework
-- **DiscUtils.Ntfs**: NTFS parsing
 - **OpenAI API**: AI-powered insights
 - **LiveChartsCore**: Data visualization
 - **Inno Setup**: Installer creation
