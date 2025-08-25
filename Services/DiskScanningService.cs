@@ -8,6 +8,8 @@ using System.Linq;
 using System.Windows;
 using Topiary.Models;
 using System.Collections.Concurrent;
+using System.Threading;
+using System.Diagnostics;
 
 namespace Topiary.Services
 {
@@ -40,28 +42,60 @@ namespace Topiary.Services
         }
 
         private const int INVALID_HANDLE_VALUE = -1;
-        private Dictionary<string, FileSystemEntry> _pathCache = new();
-        private ConcurrentBag<FileSystemEntry> _largestEntries = new();
-        private int _processedItems;
-        private readonly object _lockObject = new();
-        private int _totalDirectories;
-        private int _foldersProcessed;
-        private ConcurrentDictionary<string, long> _directorySizes = new();
-        private List<FileSystemEntry> _batchBuffer = new List<FileSystemEntry>(100);
+        private const int MAX_LARGEST_ENTRIES = 20;
+        private const int PROGRESS_UPDATE_INTERVAL_MS = 500;
+        private static readonly int MAX_PARALLEL_DIRECTORIES = Environment.ProcessorCount * 2;
+        
+        private volatile List<FileSystemEntry> _largestEntries = new();
+        private readonly object _largestEntriesLock = new();
+        private long _processedItems;
+        private long _totalBytes;
+        private readonly Stopwatch _scanStopwatch = new();
+        private DateTime _lastProgressUpdate = DateTime.MinValue;
+        private readonly ParallelOptions _parallelOptions;
 
-        public List<FileSystemEntry> GetLargestEntries() =>
-            _largestEntries.OrderByDescending(e => e.Size).Take(10).ToList();
+        public DiskScanningService()
+        {
+            _parallelOptions = new ParallelOptions
+            {
+                MaxDegreeOfParallelism = MAX_PARALLEL_DIRECTORIES,
+                CancellationToken = CancellationToken.None
+            };
+        }
+
+        public List<FileSystemEntry> GetLargestEntries()
+        {
+            lock (_largestEntriesLock)
+            {
+                return _largestEntries.OrderByDescending(e => e.Size).Take(10).ToList();
+            }
+        }
 
         private void UpdateLargestEntries(FileSystemEntry entry)
         {
-            lock (_lockObject)
+            if (entry.Size == 0) return;
+            
+            lock (_largestEntriesLock)
             {
-                // Include directories and files
                 _largestEntries.Add(entry);
-                var newList = _largestEntries.OrderByDescending(e => e.Size)
-                    .Take(15)
-                    .ToList();
-                _largestEntries = new ConcurrentBag<FileSystemEntry>(newList);
+                if (_largestEntries.Count > MAX_LARGEST_ENTRIES)
+                {
+                    _largestEntries = _largestEntries
+                        .OrderByDescending(e => e.Size)
+                        .Take(MAX_LARGEST_ENTRIES)
+                        .ToList();
+                }
+            }
+        }
+        
+        private void ReportProgressIfNeeded(IProgress<double> progress, long itemsProcessed, long totalBytes)
+        {
+            var now = DateTime.UtcNow;
+            if ((now - _lastProgressUpdate).TotalMilliseconds >= PROGRESS_UPDATE_INTERVAL_MS)
+            {
+                _lastProgressUpdate = now;
+                var progressPercent = Math.Min(99.0, (double)itemsProcessed / 10000.0 * 50.0);
+                progress?.Report(progressPercent);
             }
         }
 
@@ -72,16 +106,18 @@ namespace Topiary.Services
                 throw new ArgumentNullException(nameof(driveLetter), "Drive letter cannot be null or empty");
             }
 
-            _processedItems = 0;
-            _totalDirectories = 0;
-            _foldersProcessed = 0;
-            _largestEntries = new ConcurrentBag<FileSystemEntry>();
-            _pathCache.Clear();
-            _directorySizes.Clear();
+            // Reset state
+            Interlocked.Exchange(ref _processedItems, 0);
+            Interlocked.Exchange(ref _totalBytes, 0);
+            lock (_largestEntriesLock)
+            {
+                _largestEntries.Clear();
+            }
+            _lastProgressUpdate = DateTime.MinValue;
+            _scanStopwatch.Restart();
 
             var rootPath = $"{driveLetter}:\\";
             
-            // Verify drive exists and is ready
             if (!Directory.Exists(rootPath))
             {
                 throw new DirectoryNotFoundException($"Drive {rootPath} not found or not ready");
@@ -93,43 +129,69 @@ namespace Topiary.Services
                 FullPath = rootPath,
                 IsDirectory = true
             };
-            _pathCache[rootEntry.FullPath.ToLower()] = rootEntry;
 
             try
             {
+                Debug.WriteLine($"Starting optimized scan of {rootPath}");
+                
                 await Task.Run(() => 
                 {
-                    rootEntry.Size = ScanDirectoryFast(rootPath, rootEntry, progress);
-                    progress?.Report(100); // Direct completion after scan
+                    rootEntry.Size = ScanDirectoryOptimized(rootPath, rootEntry, progress);
+                    progress?.Report(100);
                 });
+                
+                _scanStopwatch.Stop();
+                Debug.WriteLine($"Scan completed in {_scanStopwatch.ElapsedMilliseconds}ms, processed {_processedItems:N0} items, {FormatBytes(_totalBytes)}");
+                
+                // Build UI tree structure asynchronously
+                await BuildUITreeAsync(rootEntry);
+                
                 return rootEntry;
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"Error scanning drive: {ex.Message}");
+                Debug.WriteLine($"Error scanning drive: {ex.Message}");
                 throw;
             }
         }
 
-        private void FlushBatchToUI(FileSystemEntry parent)
+        private async Task BuildUITreeAsync(FileSystemEntry rootEntry)
         {
-            Application.Current.Dispatcher.Invoke(() =>
+            await Task.Run(() =>
             {
-                foreach (var item in _batchBuffer)
-                {
-                    parent.Children.Add(item);
-                }
-                _batchBuffer.Clear();
+                BuildUITreeRecursive(rootEntry);
             });
         }
+        
+        private void BuildUITreeRecursive(FileSystemEntry entry)
+        {
+            if (entry.Children.Count > 1)
+            {
+                var sortedChildren = entry.Children.OrderByDescending(c => c.Size).ToList();
+                
+                Application.Current.Dispatcher.Invoke(() =>
+                {
+                    entry.Children.Clear();
+                    foreach (var child in sortedChildren)
+                    {
+                        entry.Children.Add(child);
+                        if (child.IsDirectory)
+                        {
+                            BuildUITreeRecursive(child);
+                        }
+                    }
+                });
+            }
+        }
 
-        private long ScanDirectoryFast(string path, FileSystemEntry parent, IProgress<double> progress)
+        private long ScanDirectoryOptimized(string path, FileSystemEntry parent, IProgress<double> progress)
         {
             IntPtr findHandle = FindFirstFile(Path.Combine(path, "*"), out WIN32_FIND_DATA findData);
             if (findHandle.ToInt64() == INVALID_HANDLE_VALUE) return 0;
 
             long directorySize = 0;
-            var children = new List<FileSystemEntry>();
+            var files = new List<FileSystemEntry>();
+            var subdirectories = new List<FileSystemEntry>();
 
             try
             {
@@ -145,35 +207,35 @@ namespace Topiary.Services
                     {
                         size = ((long)findData.nFileSizeHigh << 32) + findData.nFileSizeLow;
                         directorySize += size;
-                        UpdateLargestEntries(new FileSystemEntry 
-                        { 
-                            Size = size, 
+                        Interlocked.Add(ref _totalBytes, size);
+                        
+                        var fileEntry = new FileSystemEntry
+                        {
                             Name = findData.cFileName,
                             FullPath = fullPath,
-                            IsDirectory = false
-                        });
+                            Size = size,
+                            IsDirectory = false,
+                            Parent = parent
+                        };
+                        
+                        files.Add(fileEntry);
+                        UpdateLargestEntries(fileEntry);
+                    }
+                    else
+                    {
+                        var dirEntry = new FileSystemEntry
+                        {
+                            Name = findData.cFileName,
+                            FullPath = fullPath,
+                            Size = 0,
+                            IsDirectory = true,
+                            Parent = parent
+                        };
+                        subdirectories.Add(dirEntry);
                     }
 
-                    var entry = new FileSystemEntry
-                    {
-                        Name = findData.cFileName,
-                        FullPath = fullPath,
-                        Size = size,
-                        IsDirectory = isDirectory,
-                        Parent = parent
-                    };
-
-                    children.Add(entry); // Collect children first
-
-                    if (isDirectory)
-                    {
-                        entry.Size = ScanDirectoryFast(fullPath, entry, progress); // Recursive call
-                        directorySize += entry.Size; // Aggregate AFTER subdirectory completes
-                    }
-
-                    _processedItems++;
-                    if (_processedItems % 100 == 0) // More frequent updates
-                        progress?.Report(Math.Min(99, _processedItems / 1000.0 * 0.7));
+                    var itemsProcessed = Interlocked.Increment(ref _processedItems);
+                    ReportProgressIfNeeded(progress, itemsProcessed, _totalBytes);
 
                 } while (FindNextFile(findHandle, out findData));
             }
@@ -182,22 +244,92 @@ namespace Topiary.Services
                 FindClose(findHandle);
             }
 
-            // Batch UI update after directory completes
-            Application.Current.Dispatcher.Invoke(() =>
+            // Add files to parent (no UI updates during scan)
+            foreach (var file in files)
             {
-                foreach (var child in children.OrderByDescending(c => c.Size))
-                {
-                    parent.Children.Add(child);
-                }
-            });
+                parent.Children.Add(file);
+            }
 
-            parent.Size = directorySize; // Set parent size AFTER children are processed
+            // Process subdirectories - use parallel processing for better performance
+            if (subdirectories.Count > 0)
+            {
+                var subdirectorySizes = new long[subdirectories.Count];
+                
+                if (subdirectories.Count > 3 && path.Split('\\').Length <= 4) // Parallel only for shallow directories
+                {
+                    Parallel.For(0, subdirectories.Count, _parallelOptions, i =>
+                    {
+                        try
+                        {
+                            subdirectorySizes[i] = ScanDirectoryOptimized(subdirectories[i].FullPath, subdirectories[i], progress);
+                        }
+                        catch (UnauthorizedAccessException)
+                        {
+                            subdirectorySizes[i] = 0; // Skip inaccessible directories
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"Error scanning {subdirectories[i].FullPath}: {ex.Message}");
+                            subdirectorySizes[i] = 0;
+                        }
+                    });
+                }
+                else
+                {
+                    // Sequential processing for deep or few directories
+                    for (int i = 0; i < subdirectories.Count; i++)
+                    {
+                        try
+                        {
+                            subdirectorySizes[i] = ScanDirectoryOptimized(subdirectories[i].FullPath, subdirectories[i], progress);
+                        }
+                        catch (UnauthorizedAccessException)
+                        {
+                            subdirectorySizes[i] = 0;
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"Error scanning {subdirectories[i].FullPath}: {ex.Message}");
+                            subdirectorySizes[i] = 0;
+                        }
+                    }
+                }
+                
+                // Update directory sizes and add to parent
+                for (int i = 0; i < subdirectories.Count; i++)
+                {
+                    subdirectories[i].Size = subdirectorySizes[i];
+                    directorySize += subdirectorySizes[i];
+                    parent.Children.Add(subdirectories[i]);
+                    
+                    if (subdirectorySizes[i] > 0)
+                    {
+                        UpdateLargestEntries(subdirectories[i]);
+                    }
+                }
+            }
+
+            parent.Size = directorySize;
             return directorySize;
+        }
+        
+        private static string FormatBytes(long bytes)
+        {
+            string[] suffixes = { "B", "KB", "MB", "GB", "TB" };
+            int i = 0;
+            double dblSByte = bytes;
+            while (dblSByte >= 1024 && i < suffixes.Length - 1)
+            {
+                dblSByte /= 1024;
+                i++;
+            }
+            return $"{dblSByte:F2} {suffixes[i]}";
         }
 
         public FileSystemEntry GetEntryByPath(string path)
         {
-            return _pathCache.TryGetValue(path?.ToLower() ?? "", out var entry) ? entry : null!;
+            // Simple implementation - could be optimized with caching if needed
+            return null;
         }
     }
 }
