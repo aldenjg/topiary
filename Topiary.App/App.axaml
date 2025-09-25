@@ -1,0 +1,58 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:Topiary.App"
+             x:Class="Topiary.App.App"
+             RequestedThemeVariant="Dark">
+  <Application.DataTemplates>
+    <local:ViewLocator/>
+  </Application.DataTemplates>
+  
+  <Application.Styles>
+    <FluentTheme />
+    
+    <!-- Custom dark theme overrides -->
+    <Style Selector="TextBlock">
+      <Setter Property="FontSize" Value="13" />
+    </Style>
+    
+    <!-- Header styling -->
+    <Style Selector="Border.header">
+      <Setter Property="Background" Value="#1e1e1e" />
+      <Setter Property="BorderBrush" Value="#333" />
+      <Setter Property="BorderThickness" Value="0,0,0,1" />
+    </Style>
+    
+    <!-- Card styling -->
+    <Style Selector="Border.card">
+      <Setter Property="Background" Value="#252526" />
+      <Setter Property="BorderBrush" Value="#3e3e42" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="Padding" Value="16" />
+    </Style>
+    
+    <!-- Progress bar styling -->
+    <Style Selector="ProgressBar.scan-progress">
+      <Setter Property="Foreground" Value="#4ec9b0" />
+      <Setter Property="Background" Value="#404040" />
+      <Setter Property="Height" Value="8" />
+    </Style>
+    
+    <!-- Button styling -->
+    <Style Selector="Button.primary">
+      <Setter Property="Background" Value="#0e639c" />
+      <Setter Property="Foreground" Value="White" />
+      <Setter Property="Padding" Value="16,8" />
+      <Setter Property="CornerRadius" Value="4" />
+    </Style>
+    
+    <Style Selector="Button.primary:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="#1177bb" />
+    </Style>
+    
+    <!-- TreeDataGrid styling -->
+    <Style Selector="TreeDataGrid">
+      <Setter Property="Background" Value="#1e1e1e" />
+    </Style>
+  </Application.Styles>
+</Application>

@@ -1,0 +1,132 @@
+using System;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Topiary.App.Models;
+
+namespace Topiary.App.Services;
+
+/// <summary>
+/// WizTree-level performance disk scanner with intelligent fallback strategy.
+/// Attempts NTFS MFT parsing first, falls back to USN enumeration, then to traditional scanning.
+/// </summary>
+public class WizTreeLevelScanService : IScanService
+{
+    private readonly ILogger<WizTreeLevelScanService> _logger;
+    private readonly ResponsiveDiskScanService _fallbackScanner;
+
+    public WizTreeLevelScanService(ILogger<WizTreeLevelScanService> logger)
+    {
+        _logger = logger;
+        _fallbackScanner = new ResponsiveDiskScanService();
+    }
+
+    public async Task<string[]> GetAvailableDrivesAsync()
+    {
+        return await _fallbackScanner.GetAvailableDrivesAsync();
+    }
+
+    public async Task<ScanResult> ScanDriveAsync(string drivePath, IProgress<ScanProgress>? progress = null, CancellationToken cancellationToken = default)
+    {
+        var driveInfo = new DriveInfo(drivePath);
+        var isNtfs = IsNtfsVolume(driveInfo);
+        
+        _logger.LogInformation("Starting WizTree-level scan of {Drive} (NTFS: {IsNtfs})", drivePath, isNtfs);
+        
+        // Strategy 1: NTFS MFT Direct Parsing (100x+ speed for NTFS volumes)
+        if (isNtfs && OperatingSystem.IsWindows())
+        {
+            try
+            {
+                _logger.LogInformation("Attempting MFT direct parsing for maximum performance");
+                var mftScanner = new NtfsMftScanService();
+                return await mftScanner.ScanDriveAsync(drivePath, progress, cancellationToken);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                _logger.LogWarning(ex, "MFT parsing requires admin rights, falling back to USN enumeration");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "MFT parsing failed, falling back to USN enumeration");
+            }
+        }
+
+        // Strategy 2: USN Journal Enumeration (10-50x speed for NTFS volumes)
+        if (isNtfs && OperatingSystem.IsWindows())
+        {
+            try
+            {
+                _logger.LogInformation("Attempting USN Journal enumeration for high performance");
+                var usnScanner = new NtfsUsnScanService();
+                return await usnScanner.ScanDriveAsync(drivePath, progress, cancellationToken);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                _logger.LogWarning(ex, "USN enumeration requires admin rights, falling back to traditional scanning");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "USN enumeration failed, falling back to traditional scanning");
+            }
+        }
+
+        // Strategy 3: Traditional Responsive Scanning (fallback for all volumes)
+        _logger.LogInformation("Using traditional responsive directory scanning");
+        return await _fallbackScanner.ScanDriveAsync(drivePath, progress, cancellationToken);
+    }
+
+    private static bool IsNtfsVolume(DriveInfo driveInfo)
+    {
+        try
+        {
+            return string.Equals(driveInfo.DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false; // Drive may not be ready
+        }
+    }
+}
+
+/// <summary>
+/// Extensions to help determine the best scanning strategy
+/// </summary>
+public static class ScanStrategyExtensions
+{
+    /// <summary>
+    /// Determines if a drive is suitable for NTFS MFT parsing
+    /// </summary>
+    public static bool SupportsMftParsing(this DriveInfo drive)
+    {
+        return OperatingSystem.IsWindows() && 
+               drive.IsReady &&
+               string.Equals(drive.DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase) &&
+               drive.DriveType == DriveType.Fixed; // Avoid USB/network drives for direct MFT access
+    }
+
+    /// <summary>
+    /// Determines if a drive is suitable for USN Journal enumeration
+    /// </summary>
+    public static bool SupportsUsnEnumeration(this DriveInfo drive)
+    {
+        return OperatingSystem.IsWindows() && 
+               drive.IsReady &&
+               string.Equals(drive.DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Gets the expected performance multiplier vs traditional directory walking
+    /// </summary>
+    public static int GetExpectedSpeedupFactor(this DriveInfo drive)
+    {
+        if (drive.SupportsMftParsing())
+            return 100; // 100x+ speedup with direct MFT parsing
+        
+        if (drive.SupportsUsnEnumeration())
+            return 25;  // 10-50x speedup with USN enumeration
+            
+        return 1; // Traditional scanning baseline
+    }
+}

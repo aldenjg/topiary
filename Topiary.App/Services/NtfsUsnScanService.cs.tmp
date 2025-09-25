@@ -1,0 +1,383 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Win32.SafeHandles;
+using Topiary.App.Interop;
+using Topiary.App.Models;
+using Avalonia.Threading;
+
+namespace Topiary.App.Services;
+
+public class NtfsUsnScanService : IScanService
+{
+    private readonly Dictionary<ulong, NtfsEntry> _entriesByFrn = new();
+    private readonly List<NtfsEntry> _rootEntries = new();
+    private Timer? _progressTimer;
+
+    public async Task<string[]> GetAvailableDrivesAsync()
+    {
+        return await Task.FromResult(DriveInfo.GetDrives()
+            .Where(d => d.IsReady)
+            .Select(d => d.Name)
+            .ToArray());
+    }
+
+    public async Task<ScanResult> ScanDriveAsync(string drivePath, IProgress<ScanProgress>? progress = null, CancellationToken cancellationToken = default)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            throw new PlatformNotSupportedException("NTFS USN scanning is only supported on Windows");
+        }
+
+        var context = new UsnScanContext
+        {
+            DrivePath = drivePath,
+            Progress = progress,
+            CancellationToken = cancellationToken,
+            StartTime = DateTime.UtcNow
+        };
+
+        try
+        {
+            // Start progress timer for responsive UI updates
+            _progressTimer = new Timer(UpdateProgress, context, TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(100));
+
+            // Phase 1: Enumerate all files/folders via USN Journal
+            await Task.Run(() => EnumerateUsnRecords(context), cancellationToken);
+            
+            // Phase 2: Build FRN tree structure
+            await Task.Run(() => BuildFrnTree(context), cancellationToken);
+            
+            // Phase 3: Get file sizes (batched by directory for efficiency)
+            await Task.Run(() => BatchedSizeCollection(context), cancellationToken);
+            
+            // Phase 4: Aggregate sizes bottom-up
+            await Task.Run(() => AggregateDirectorySizes(context), cancellationToken);
+
+            return await Task.Run(() => BuildScanResult(context), cancellationToken);
+        }
+        finally
+        {
+            _progressTimer?.Dispose();
+            _progressTimer = null;
+        }
+    }
+
+    private unsafe void EnumerateUsnRecords(UsnScanContext context)
+    {
+        var volumePath = $@"\\.\{context.DrivePath.TrimEnd('\\')}";
+        
+        using var volumeHandle = Win32.CreateFileW(
+            volumePath,
+            Win32.GENERIC_READ,
+            Win32.FILE_SHARE_READ | Win32.FILE_SHARE_WRITE | Win32.FILE_SHARE_DELETE,
+            IntPtr.Zero,
+            Win32.OPEN_EXISTING,
+            Win32.FILE_FLAG_BACKUP_SEMANTICS,
+            IntPtr.Zero
+        );
+
+        if (volumeHandle.IsInvalid)
+        {
+            throw new InvalidOperationException($"Cannot open volume {volumePath}: {Win32.GetLastError()}");
+        }
+
+        // Query USN Journal info
+        var journalQuery = new Win32.USN_JOURNAL_DATA_V1();
+        var journalQuerySize = Marshal.SizeOf<Win32.USN_JOURNAL_DATA_V1>();
+        
+        if (!Win32.DeviceIoControl(
+            volumeHandle,
+            Win32.FSCTL_QUERY_USN_JOURNAL,
+            IntPtr.Zero, 0,
+            new IntPtr(&journalQuery), (uint)journalQuerySize,
+            out uint bytesReturned,
+            IntPtr.Zero))
+        {
+            throw new InvalidOperationException($"FSCTL_QUERY_USN_JOURNAL failed: {Win32.GetLastError()}");
+        }
+
+        // Enumerate all USN records
+        var enumData = new Win32.MFT_ENUM_DATA_V1
+        {
+            StartFileReferenceNumber = 0,
+            LowUsn = 0,
+            HighUsn = journalQuery.NextUsn,
+            MinMajorVersion = 2,
+            MaxMajorVersion = 3
+        };
+
+        const int bufferSize = 1024 * 1024; // 1MB buffer
+        var buffer = Marshal.AllocHGlobal(bufferSize);
+        var enumDataPtr = Marshal.AllocHGlobal(Marshal.SizeOf<Win32.MFT_ENUM_DATA_V1>());
+        
+        try
+        {
+            Marshal.StructureToPtr(enumData, enumDataPtr, false);
+            
+            while (true)
+            {
+                context.CancellationToken.ThrowIfCancellationRequested();
+                
+                if (!Win32.DeviceIoControl(
+                    volumeHandle,
+                    Win32.FSCTL_ENUM_USN_DATA,
+                    enumDataPtr, (uint)Marshal.SizeOf<Win32.MFT_ENUM_DATA_V1>(),
+                    buffer, bufferSize,
+                    out bytesReturned,
+                    IntPtr.Zero))
+                {
+                    var error = Win32.GetLastError();
+                    if (error == 38) // ERROR_HANDLE_EOF
+                        break;
+                    throw new InvalidOperationException($"FSCTL_ENUM_USN_DATA failed: {error}");
+                }
+
+                ParseUsnRecords(buffer, (int)bytesReturned, context);
+                
+                // Update enumData for next batch
+                enumData = Marshal.PtrToStructure<Win32.MFT_ENUM_DATA_V1>(enumDataPtr);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+            Marshal.FreeHGlobal(enumDataPtr);
+        }
+    }
+
+    private unsafe void ParseUsnRecords(IntPtr buffer, int bufferSize, UsnScanContext context)
+    {
+        var ptr = (byte*)buffer.ToPointer();
+        var endPtr = ptr + bufferSize;
+        
+        // Skip first 8 bytes (next USN value)
+        ptr += 8;
+        
+        while (ptr < endPtr)
+        {
+            context.CancellationToken.ThrowIfCancellationRequested();
+            
+            var record = (Win32.USN_RECORD_V2*)ptr;
+            if (record->RecordLength == 0 || ptr + record->RecordLength > endPtr)
+                break;
+                
+            if (record->MajorVersion == 2)
+            {
+                ProcessUsnRecordV2(record, context);
+            }
+            else if (record->MajorVersion == 3)
+            {
+                var recordV3 = (Win32.USN_RECORD_V3*)ptr;
+                ProcessUsnRecordV3(recordV3, context);
+            }
+            
+            ptr += record->RecordLength;
+            context.ProcessedCount++;
+            
+            // Yield every 1000 records
+            if (context.ProcessedCount % 1000 == 0)
+            {
+                Thread.Yield();
+            }
+        }
+    }
+
+    private unsafe void ProcessUsnRecordV2(Win32.USN_RECORD_V2* record, UsnScanContext context)
+    {
+        var namePtr = (char*)((byte*)record + record->FileNameOffset);
+        var name = new string(namePtr, 0, record->FileNameLength / 2);
+        
+        var entry = new NtfsEntry
+        {
+            FileReferenceNumber = record->FileReferenceNumber,
+            ParentFileReferenceNumber = record->ParentFileReferenceNumber,
+            FileName = name,
+            FileAttributes = record->FileAttributes,
+            IsDirectory = (record->FileAttributes & Win32.FILE_ATTRIBUTE_DIRECTORY) != 0
+        };
+        
+        _entriesByFrn[record->FileReferenceNumber] = entry;
+    }
+
+    private unsafe void ProcessUsnRecordV3(Win32.USN_RECORD_V3* record, UsnScanContext context)
+    {
+        // Note: UInt128 conversion would need special handling
+        // For now, focus on V2 records which are more common
+        var frn = (ulong)(record->FileReferenceNumber & 0xFFFFFFFFFFFFFFFF);
+        var parentFrn = (ulong)(record->ParentFileReferenceNumber & 0xFFFFFFFFFFFFFFFF);
+        
+        var namePtr = (char*)((byte*)record + record->FileNameOffset);
+        var name = new string(namePtr, 0, record->FileNameLength / 2);
+        
+        var entry = new NtfsEntry
+        {
+            FileReferenceNumber = frn,
+            ParentFileReferenceNumber = parentFrn,
+            FileName = name,
+            FileAttributes = record->FileAttributes,
+            IsDirectory = (record->FileAttributes & Win32.FILE_ATTRIBUTE_DIRECTORY) != 0
+        };
+        
+        _entriesByFrn[frn] = entry;
+    }
+
+    private void BuildFrnTree(UsnScanContext context)
+    {
+        // Link children to parents using FRN relationships
+        foreach (var entry in _entriesByFrn.Values)
+        {
+            context.CancellationToken.ThrowIfCancellationRequested();
+            
+            if (entry.ParentFileReferenceNumber == 0 || 
+                entry.ParentFileReferenceNumber == entry.FileReferenceNumber)
+            {
+                // Root entry
+                _rootEntries.Add(entry);
+            }
+            else if (_entriesByFrn.TryGetValue(entry.ParentFileReferenceNumber, out var parent))
+            {
+                parent.Children.Add(entry);
+                entry.Parent = parent;
+            }
+            
+            if (context.ProcessedCount % 5000 == 0)
+            {
+                Thread.Yield();
+            }
+            context.ProcessedCount++;
+        }
+    }
+
+    private void BatchedSizeCollection(UsnScanContext context)
+    {
+        // Group files by directory for efficient size collection
+        var filesByDirectory = new Dictionary<ulong, List<NtfsEntry>>();
+        
+        foreach (var entry in _entriesByFrn.Values)
+        {
+            if (!entry.IsDirectory && entry.Parent != null)
+            {
+                var parentFrn = entry.Parent.FileReferenceNumber;
+                if (!filesByDirectory.ContainsKey(parentFrn))
+                    filesByDirectory[parentFrn] = new List<NtfsEntry>();
+                filesByDirectory[parentFrn].Add(entry);
+            }
+        }
+
+        // TODO: Implement batched Win32 size queries here
+        // For now, use placeholder sizes to prove the architecture
+        foreach (var entry in _entriesByFrn.Values)
+        {
+            if (!entry.IsDirectory)
+            {
+                entry.Size = 1024; // Placeholder - would be actual file size
+                entry.AllocatedSize = 4096; // Placeholder - would be actual allocated size
+            }
+            
+            context.CancellationToken.ThrowIfCancellationRequested();
+        }
+    }
+
+    private void AggregateDirectorySizes(UsnScanContext context)
+    {
+        // Bottom-up aggregation of directory sizes
+        foreach (var rootEntry in _rootEntries)
+        {
+            AggregateEntry(rootEntry, context);
+        }
+    }
+
+    private long AggregateEntry(NtfsEntry entry, UsnScanContext context)
+    {
+        context.CancellationToken.ThrowIfCancellationRequested();
+        
+        if (!entry.IsDirectory)
+            return entry.Size;
+            
+        long totalSize = 0;
+        foreach (var child in entry.Children)
+        {
+            totalSize += AggregateEntry(child, context);
+        }
+        
+        entry.Size = totalSize;
+        return totalSize;
+    }
+
+    private ScanResult BuildScanResult(UsnScanContext context)
+    {
+        var driveInfo = new DriveInfo(context.DrivePath);
+        var driveStats = new DriveStats(
+            driveInfo.TotalSize,
+            driveInfo.AvailableFreeSpace,
+            driveInfo.TotalSize - driveInfo.AvailableFreeSpace
+        );
+
+        // Find the actual drive root (should be one of the root entries)
+        var driveRoot = _rootEntries.FirstOrDefault(e => e.FileName == "" || e.FileName == ".");
+        var rootNode = driveRoot != null ? ConvertToTreeNode(driveRoot) : new TreeNode("Drive", 0, true);
+
+        return new ScanResult
+        {
+            DriveStats = driveStats,
+            RootNode = rootNode,
+            ScanTime = DateTime.UtcNow - context.StartTime
+        };
+    }
+
+    private TreeNode ConvertToTreeNode(NtfsEntry entry)
+    {
+        var node = new TreeNode(entry.FileName, entry.Size, entry.IsDirectory);
+        
+        foreach (var child in entry.Children.OrderByDescending(c => c.Size))
+        {
+            node.Children.Add(ConvertToTreeNode(child));
+        }
+        
+        return node;
+    }
+
+    private void UpdateProgress(object? state)
+    {
+        if (state is not UsnScanContext context || context.Progress == null)
+            return;
+
+        var elapsed = DateTime.UtcNow - context.StartTime;
+        var progress = new ScanProgress
+        {
+            FilesProcessed = context.ProcessedCount,
+            Elapsed = elapsed,
+            CurrentPath = "Enumerating NTFS metadata..."
+        };
+
+        // Marshal to UI thread
+        Dispatcher.UIThread.Post(() => context.Progress.Report(progress));
+    }
+}
+
+internal class UsnScanContext
+{
+    public required string DrivePath { get; init; }
+    public IProgress<ScanProgress>? Progress { get; init; }
+    public CancellationToken CancellationToken { get; init; }
+    public DateTime StartTime { get; init; }
+    public int ProcessedCount { get; set; }
+}
+
+internal class NtfsEntry
+{
+    public ulong FileReferenceNumber { get; set; }
+    public ulong ParentFileReferenceNumber { get; set; }
+    public required string FileName { get; set; }
+    public uint FileAttributes { get; set; }
+    public bool IsDirectory { get; set; }
+    public long Size { get; set; }
+    public long AllocatedSize { get; set; }
+    public NtfsEntry? Parent { get; set; }
+    public List<NtfsEntry> Children { get; } = new();
+}

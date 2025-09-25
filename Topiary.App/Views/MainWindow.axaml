@@ -1,0 +1,157 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:Topiary.App.ViewModels"
+        xmlns:lvc="using:LiveChartsCore.SkiaSharpView.Avalonia"
+        x:Class="Topiary.App.Views.MainWindow"
+        x:DataType="vm:MainViewModel"
+        Title="Topiary - AI-Powered Disk Analyzer"
+        Width="1200"
+        Height="800"
+        Background="#1e1e1e">
+
+  <Design.DataContext>
+    <vm:MainViewModel/>
+  </Design.DataContext>
+
+  <Grid RowDefinitions="Auto,*">
+    <!-- Header -->
+    <Border Grid.Row="0" Classes="header" Padding="16">
+      <Grid ColumnDefinitions="Auto,*,Auto,Auto">
+        <TextBlock Grid.Column="0" Text="Topiary" FontSize="18" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,24,0"/>
+        
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+          <TextBlock Text="Drive:" VerticalAlignment="Center"/>
+          <ComboBox ItemsSource="{Binding AvailableDrives}" 
+                    SelectedItem="{Binding SelectedDrive}"
+                    Width="80"/>
+        </StackPanel>
+        
+        <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="8">
+          <Button Classes="primary"
+                  Command="{Binding ScanCommand}"
+                  Content="Scan Drive"
+                  IsEnabled="{Binding !IsScanning}"/>
+          <Button Content="Cancel"
+                  IsVisible="{Binding IsScanning}"
+                  Click="CancelScan_Click"
+                  Background="#d73527"
+                  Foreground="White"
+                  Padding="12,8"
+                  CornerRadius="4"/>
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <!-- Main Content -->
+    <Grid Grid.Row="1" Margin="16" RowDefinitions="Auto,*">
+      
+      <!-- Progress Bar (visible during scan) -->
+      <Border Grid.Row="0" 
+              IsVisible="{Binding IsScanning}"
+              Classes="card" 
+              Margin="0,0,0,16">
+        <StackPanel Spacing="8">
+          <Grid ColumnDefinitions="*,Auto">
+            <TextBlock Grid.Column="0" 
+                       Text="{Binding CurrentPath, StringFormat='Scanning: {0}'}" 
+                       TextTrimming="CharacterEllipsis"/>
+            <TextBlock Grid.Column="1" 
+                       Text="{Binding ElapsedTime}"
+                       HorizontalAlignment="Right"/>
+          </Grid>
+          
+          <ProgressBar Classes="scan-progress" 
+                       Value="{Binding ScanProgress}" 
+                       Maximum="100"/>
+          
+          <Grid ColumnDefinitions="*,Auto">
+            <TextBlock Grid.Column="0" 
+                       Text="{Binding ScanProgress, StringFormat={}{0:F1}% complete}"/>
+            <TextBlock Grid.Column="1" 
+                       Text="{Binding FilesProcessed, StringFormat={}{0:N0} files processed}"/>
+          </Grid>
+        </StackPanel>
+      </Border>
+
+      <!-- Results (visible after scan) -->
+      <Grid Grid.Row="1" 
+            IsVisible="{Binding HasScanResult}"
+            ColumnDefinitions="2*,*">
+        
+        <!-- Left Panel: Tree View -->
+        <Border Grid.Column="0" Classes="card" Margin="0,0,8,0">
+          <Grid RowDefinitions="Auto,*">
+            <TextBlock Grid.Row="0" 
+                       Text="Folder Tree" 
+                       FontSize="16" 
+                       FontWeight="SemiBold" 
+                       Margin="0,0,0,12"/>
+            
+            <TreeView Grid.Row="1" 
+                      ItemsSource="{Binding TreeNodes}">
+              <TreeView.ItemTemplate>
+                <TreeDataTemplate ItemsSource="{Binding Children}">
+                  <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="{Binding Name}" Margin="0,0,8,0"/>
+                    <TextBlock Text="{Binding FormattedSize}" Foreground="Gray"/>
+                  </StackPanel>
+                </TreeDataTemplate>
+              </TreeView.ItemTemplate>
+            </TreeView>
+          </Grid>
+        </Border>
+
+        <!-- Right Panel: Chart and AI -->
+        <Grid Grid.Column="1" RowDefinitions="*,*" Margin="8,0,0,0">
+          
+          <!-- Drive Usage Chart -->
+          <Border Grid.Row="0" Classes="card" Margin="0,0,0,8">
+            <Grid RowDefinitions="Auto,*">
+              <TextBlock Grid.Row="0" 
+                         Text="Drive Usage" 
+                         FontSize="16" 
+                         FontWeight="SemiBold" 
+                         Margin="0,0,0,12"/>
+              
+              <lvc:PieChart Grid.Row="1" 
+                            Series="{Binding PieChartSeries}"
+                            LegendPosition="Bottom"/>
+            </Grid>
+          </Border>
+
+          <!-- AI Insights -->
+          <Border Grid.Row="1" Classes="card" Margin="0,8,0,0">
+            <Grid RowDefinitions="Auto,*">
+              <TextBlock Grid.Row="0" 
+                         Text="AI Insights" 
+                         FontSize="16" 
+                         FontWeight="SemiBold" 
+                         Margin="0,0,0,12"/>
+              
+              <ScrollViewer Grid.Row="1">
+                <StackPanel Spacing="12">
+                  <!-- AI Request -->
+                  <Expander Header="Request JSON" IsExpanded="False">
+                    <TextBox Text="{Binding AiRequest}" 
+                             IsReadOnly="True"
+                             TextWrapping="Wrap"
+                             FontFamily="Consolas"
+                             FontSize="11"
+                             Background="#2d2d30"
+                             MaxHeight="200"/>
+                  </Expander>
+                  
+                  <!-- AI Response -->
+                  <TextBlock Text="{Binding AiResponse}" 
+                             TextWrapping="Wrap"
+                             FontSize="12"
+                             LineHeight="20"/>
+                </StackPanel>
+              </ScrollViewer>
+            </Grid>
+          </Border>
+        </Grid>
+      </Grid>
+    </Grid>
+  </Grid>
+</Window>
